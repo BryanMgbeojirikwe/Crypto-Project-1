@@ -142,7 +142,7 @@ static void tsappend(char* message, char** tagnames, int ensurenewline)
 	gtk_text_buffer_delete_mark(tbuf,mark);
 }
 
-static void sendMessage(GtkWidget* w /* <-- msg entry widget */, gpointer /* data */)
+static void sendMessage(GtkWidget* w /* <-- msg entry widget */, gpointer data)
 {
 	char* tags[2] = {"self",NULL};
 	tsappend("me: ",tags,0);
@@ -276,7 +276,7 @@ int main(int argc, char *argv[])
 
 /* thread function to listen for new messages and post them to the gtk
  * main loop for processing: */
-void* recvMsg(void*)
+void* recvMsg(void* arg)
 {
 	size_t maxlen = 512;
 	char msg[maxlen+2]; /* might add \n and \0 */
