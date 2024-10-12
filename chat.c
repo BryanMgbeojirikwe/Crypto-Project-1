@@ -1,3 +1,6 @@
+#define MAX_MESSAGE_SIZE 65536 // 64 KB or another appropriate value
+#define MAX_PLAINTEXT_LENGTH 65536 // or any appropriate value, similar to MAX_MESSAGE_SIZE
+
 #include <gtk/gtk.h>
 #include <glib/gunicode.h> /* for utf8 strlen */
 #include <sys/socket.h>
@@ -19,6 +22,8 @@
 #define HMAC_LENGTH 32    // Length of HMAC-SHA256
 #ifndef PATH_MAX
 #define PATH_MAX 1024
+
+
 #endif
 
 
@@ -28,6 +33,7 @@ static GtkTextView*  tview; /* view for transcript */
 static GtkTextMark*   mark; /* used for scrolling to end of transcript, etc */
 unsigned char sharedSecret[32];
 static pthread_t trecv;     /* wait for incoming messagess and post to queue */
+ssize_t recvAll(int sockfd, void* buffer, size_t length);
 void* recvMsg(void*);       /* for trecv */
 
 #define max(a, b)         \
@@ -239,11 +245,17 @@ static void tsappend(char* message, char** tagnames, int ensurenewline)
 
 //=================================================================================================================================
 
-static void encryptAndSendMessage(const unsigned char* sharedSecret, const char* plaintext)
-{
+static void encryptAndSendMessage(const unsigned char* sharedSecret, const char* plaintext) {
     size_t plaintextLen = strlen(plaintext);
+
+    // Limit the size of the plaintext
+    if (plaintextLen == 0 || plaintextLen > MAX_PLAINTEXT_LENGTH) {
+        fprintf(stderr, "Invalid plaintext length.\n");
+        return;
+    }
+
     unsigned char iv[AES_BLOCK_SIZE];
-    unsigned char ciphertext[plaintextLen + AES_BLOCK_SIZE];
+    unsigned char* ciphertext = NULL;
     unsigned char hmac[HMAC_LENGTH];
     int ciphertextLen;
 
@@ -252,23 +264,36 @@ static void encryptAndSendMessage(const unsigned char* sharedSecret, const char*
         error("IV generation failed");
     }
 
+    // Allocate memory for ciphertext
+    ciphertext = malloc(plaintextLen + AES_BLOCK_SIZE); // Extra space for safety
+    if (!ciphertext) {
+        error("Failed to allocate memory for ciphertext");
+    }
+
     // Step 2: Encrypt the plaintext using AES in CTR mode
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
+        free(ciphertext);
         error("Failed to create encryption context");
     }
 
     if (EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, sharedSecret, iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        free(ciphertext);
         error("Encryption initialization failed");
     }
 
     int len;
     if (EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char*)plaintext, plaintextLen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        free(ciphertext);
         error("Encryption failed");
     }
     ciphertextLen = len;
 
     if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
+        free(ciphertext);
         error("Final encryption step failed");
     }
     ciphertextLen += len;
@@ -276,6 +301,7 @@ static void encryptAndSendMessage(const unsigned char* sharedSecret, const char*
 
     // Step 3: Generate HMAC for the ciphertext
     HMAC(EVP_sha256(), sharedSecret, AES_KEY_LENGTH, ciphertext, ciphertextLen, hmac, NULL);
+
 
 /* TEST FUNCTION TO CHECK IF ENCRYPTED PROPERLY
 
@@ -296,12 +322,15 @@ for (int i = 0; i < HMAC_LENGTH; i++) {
 printf("\n");
 */
 
-    // Step 4: Send the message size, IV, ciphertext, and HMAC
-    size_t messageSize = ciphertextLen;
-    xwrite(sockfd, &messageSize, sizeof(messageSize)); // Send message size
-    xwrite(sockfd, iv, AES_BLOCK_SIZE);                // Send IV
-    xwrite(sockfd, ciphertext, ciphertextLen);         // Send ciphertext
-    xwrite(sockfd, hmac, HMAC_LENGTH);                 // Send HMAC
+ // Step 4: Send the message size, IV, ciphertext, and HMAC
+    uint32_t netMessageSize = htonl(ciphertextLen);
+    xwrite(sockfd, &netMessageSize, sizeof(netMessageSize)); // Send message size in network byte order
+    xwrite(sockfd, iv, AES_BLOCK_SIZE);                      // Send IV
+    xwrite(sockfd, ciphertext, ciphertextLen);               // Send ciphertext
+    xwrite(sockfd, hmac, HMAC_LENGTH);                       // Send HMAC
+
+    // Clean up
+    free(ciphertext);
 }
 
 
@@ -340,7 +369,7 @@ static gboolean shownewmessage(gpointer msg)
 
 static int decryptMessage(const unsigned char* sharedSecret, const unsigned char* iv, 
                           const unsigned char* ciphertext, size_t ciphertextLen, 
-                          const unsigned char* receivedHmac, char* plaintext) 
+                          const unsigned char* receivedHmac, char* plaintext, size_t plaintextBufferSize) 
 {
     // Step 1: Verify HMAC
     unsigned char computedHmac[HMAC_LENGTH];
@@ -357,26 +386,40 @@ static int decryptMessage(const unsigned char* sharedSecret, const unsigned char
     }
 
     if (EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, sharedSecret, iv) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
         error("Decryption initialization failed");
     }
 
     int len;
-    int plaintextLen;
+    int plaintextLen = 0;
     if (EVP_DecryptUpdate(ctx, (unsigned char*)plaintext, &len, ciphertext, ciphertextLen) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
         error("Decryption failed");
     }
-    plaintextLen = len;
+    plaintextLen += len;
 
-    if (EVP_DecryptFinal_ex(ctx, (unsigned char*)plaintext + len, &len) != 1) {
+    if ((size_t)plaintextLen >= plaintextBufferSize) {
+        EVP_CIPHER_CTX_free(ctx);
+        fprintf(stderr, "Decrypted plaintext too large for buffer\n");
+        return -1;
+    }
+
+    if (EVP_DecryptFinal_ex(ctx, (unsigned char*)plaintext + plaintextLen, &len) != 1) {
+        EVP_CIPHER_CTX_free(ctx);
         error("Final decryption step failed");
     }
     plaintextLen += len;
+
+    if ((size_t)plaintextLen >= plaintextBufferSize) {
+        EVP_CIPHER_CTX_free(ctx);
+        fprintf(stderr, "Decrypted plaintext too large for buffer\n");
+        return -1;
+    }
 
     EVP_CIPHER_CTX_free(ctx);
 
     // Null-terminate the plaintext
     plaintext[plaintextLen] = '\0';
-
 /* TEST FUNCTION TO CHECK IF DECRYPTED PROPERLY
 	if (plaintextLen >= 0) {
     printf("Decrypted plaintext: %s\n", plaintext);
@@ -506,67 +549,70 @@ int main(int argc, char *argv[])
 //====================================================================================================================
 /* thread function to listen for new messages and post them to the gtk
  * main loop for processing: */
-
 void* recvMsg(void* arg) {
     unsigned char iv[AES_BLOCK_SIZE];
     unsigned char hmac[HMAC_LENGTH];
     ssize_t nbytes;
+    uint32_t netMessageSize;
     size_t messageSize;
 
     while (1) {
-        // Step 1: Receive the message size
-        nbytes = recv(sockfd, &messageSize, sizeof(messageSize), 0);
-        if (nbytes <= 0) {
+        // Step 1: Receive the message size (always 4 bytes)
+        nbytes = recvAll(sockfd, &netMessageSize, sizeof(netMessageSize));
+        if (nbytes != sizeof(netMessageSize)) {
             error("Failed to receive message size");
-            return 0;
+            break;
         }
 
+        // Convert messageSize from network byte order to host byte order
+        messageSize = ntohl(netMessageSize);
+
         // Validate messageSize before allocating memory
-        if (messageSize > 1024 * 1024) { // Limit to 1 MB for safety
-            fprintf(stderr, "Message size too large: %zu bytes\n", messageSize);
+        if (messageSize == 0 || messageSize > MAX_MESSAGE_SIZE) { // Define MAX_MESSAGE_SIZE appropriately
+            fprintf(stderr, "Invalid message size: %zu bytes\n", messageSize);
             continue;
         }
 
         // Step 2: Receive the IV
-        nbytes = recv(sockfd, iv, AES_BLOCK_SIZE, 0);
+        nbytes = recvAll(sockfd, iv, AES_BLOCK_SIZE);
         if (nbytes != AES_BLOCK_SIZE) {
             error("Failed to receive IV");
-            return 0;
+            break;
         }
 
         // Step 3: Allocate buffer for ciphertext based on message size
         unsigned char* ciphertext = malloc(messageSize);
         if (!ciphertext) {
             error("Failed to allocate memory for ciphertext");
-            return 0;
+            break;
         }
 
         // Step 4: Receive the ciphertext
-        nbytes = recv(sockfd, ciphertext, messageSize, 0);
-        if (nbytes <= 0) {
+        nbytes = recvAll(sockfd, ciphertext, messageSize);
+        if (nbytes != (ssize_t)messageSize) {
             free(ciphertext);
-            error("Failed to receive ciphertext");
-            return 0;
+            error("Failed to receive complete ciphertext");
+            break;
         }
-        size_t ciphertextLen = nbytes;
 
         // Step 5: Receive the HMAC
-        nbytes = recv(sockfd, hmac, HMAC_LENGTH, 0);
+        nbytes = recvAll(sockfd, hmac, HMAC_LENGTH);
         if (nbytes != HMAC_LENGTH) {
             free(ciphertext);
             error("Failed to receive HMAC");
-            return 0;
+            break;
         }
 
-        // Step 6: Decrypt the message
-        char* plaintext = malloc(messageSize + 1);
+        // Step 6: Allocate buffer for plaintext
+        size_t plaintextBufferSize = messageSize + 1; // +1 for null terminator
+        char* plaintext = malloc(plaintextBufferSize);
         if (!plaintext) {
             free(ciphertext);
             error("Failed to allocate memory for plaintext");
-            return 0;
+            break;
         }
 
-        int plaintextLen = decryptMessage(sharedSecret, iv, ciphertext, ciphertextLen, hmac, plaintext);
+        int plaintextLen = decryptMessage(sharedSecret, iv, ciphertext, messageSize, hmac, plaintext, plaintextBufferSize);
         if (plaintextLen < 0) {
             free(ciphertext);
             free(plaintext);
@@ -574,22 +620,27 @@ void* recvMsg(void* arg) {
             continue;
         }
 
-        // Step 7: Display the message
-        char* decryptedMsg = malloc(plaintextLen + 1);
-        if (!decryptedMsg) {
-            free(ciphertext);
-            free(plaintext);
-            error("Failed to allocate memory for decrypted message");
-            return 0;
-        }
-
-        memcpy(decryptedMsg, plaintext, plaintextLen);
-        decryptedMsg[plaintextLen] = '\0';
-        g_main_context_invoke(NULL, shownewmessage, (gpointer)decryptedMsg);
+        // Step 7: Null-terminate and display the message
+        plaintext[plaintextLen] = '\0';
+        g_main_context_invoke(NULL, shownewmessage, (gpointer)plaintext);
 
         free(ciphertext);
-        free(plaintext);
+        // Note: Do not free plaintext here as it's passed to the GUI thread
     }
+    return NULL;
+}
 
-    return 0;
+// Implementation of recvAll function
+ssize_t recvAll(int sockfd, void* buffer, size_t length) {
+    size_t totalReceived = 0;
+    ssize_t bytesReceived;
+
+    while (totalReceived < length) {
+        bytesReceived = recv(sockfd, (char*)buffer + totalReceived, length - totalReceived, 0);
+        if (bytesReceived <= 0) {
+            return bytesReceived; // Error or connection closed
+        }
+        totalReceived += bytesReceived;
+    }
+    return totalReceived;
 }
