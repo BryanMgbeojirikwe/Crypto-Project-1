@@ -1,5 +1,6 @@
 #define MAX_MESSAGE_SIZE 65536 // 64 KB or another appropriate value
 #define MAX_PLAINTEXT_LENGTH 65536 // or any appropriate value, similar to MAX_MESSAGE_SIZE
+#define HASH_LEN 32  // SHA256 produces 32 bytes of output
 
 #include <gtk/gtk.h>
 #include <glib/gunicode.h> /* for utf8 strlen */
@@ -15,7 +16,7 @@
 #include <openssl/rand.h>
 #include <openssl/aes.h>
 #include "util.h"
-
+#include <string.h>
 
 #define AES_KEY_LENGTH 32 // 256-bit AES key
 #define AES_BLOCK_SIZE 16 // Block size for AES
@@ -35,6 +36,60 @@ unsigned char sharedSecret[32];
 static pthread_t trecv;     /* wait for incoming messagess and post to queue */
 ssize_t recvAll(int sockfd, void* buffer, size_t length);
 void* recvMsg(void*);       /* for trecv */
+unsigned char encryptionKey[AES_KEY_LENGTH];  // 256-bit encryption key
+unsigned char hmacKey[HMAC_LENGTH];           // HMAC key (256 bits for SHA256)
+static void printerror(const char *msg);
+
+//===============================================================================================
+
+// HKDF-Extract: PRK = HMAC-Hash(salt, IKM)
+void hkdf_extract(const unsigned char *salt, size_t salt_len, 
+                  const unsigned char *ikm, size_t ikm_len, 
+                  unsigned char *prk) {
+    if (salt == NULL) {
+        unsigned char default_salt[HASH_LEN] = {0};
+        salt = default_salt;
+        salt_len = HASH_LEN;
+    }
+    HMAC(EVP_sha256(), salt, salt_len, ikm, ikm_len, prk, NULL);
+}
+
+// HKDF-Expand: Output = T(1) | T(2) | ... | T(n) (up to L bytes of output)
+void hkdf_expand(const unsigned char *prk, size_t prk_len, 
+                 const unsigned char *info, size_t info_len, 
+                 unsigned char *okm, size_t okm_len) {
+    unsigned int hash_len = HASH_LEN;
+    unsigned int n = (okm_len + hash_len - 1) / hash_len;  // Number of rounds
+    unsigned char t[HASH_LEN];
+    unsigned char previous_t[HASH_LEN];
+    unsigned int previous_len = 0;
+
+    for (unsigned int i = 1; i <= n; i++) {
+        HMAC_CTX *ctx = HMAC_CTX_new();
+        if (!ctx) printerror("Failed to create HMAC context");
+
+        HMAC_Init_ex(ctx, prk, prk_len, EVP_sha256(), NULL);
+        if (previous_len > 0) {
+            HMAC_Update(ctx, previous_t, previous_len);  // T(i-1)
+        }
+        if (info != NULL) {
+            HMAC_Update(ctx, info, info_len);  // info
+        }
+        unsigned char c = (unsigned char)i;
+        HMAC_Update(ctx, &c, 1);  // i as a single byte
+
+        HMAC_Final(ctx, t, &hash_len);
+        HMAC_CTX_free(ctx);
+
+        // Copy the result to okm
+        size_t copy_len = (i == n) ? (okm_len - (i - 1) * hash_len) : hash_len;
+        memcpy(okm + (i - 1) * hash_len, t, copy_len);
+
+        // Save T(i) for the next round
+        memcpy(previous_t, t, hash_len);
+        previous_len = hash_len;
+    }
+}
 
 #define max(a, b)         \
 	({ typeof(a) _a = a;    \
@@ -46,33 +101,33 @@ void* recvMsg(void*);       /* for trecv */
 static int listensock, sockfd;
 static int isclient = 1;
 
-static void error(const char *msg)
+static void printerror(const char *msg)
 {
 	perror(msg);
 	exit(EXIT_FAILURE);
 }
 //=======================================================================================================================
-int initServerNet(int port)
+static int initServerNet(int port)
 {
-	int reuse = 1;
+    int reuse = 1;
     struct sockaddr_in serv_addr;
     listensock = socket(AF_INET, SOCK_STREAM, 0);
     setsockopt(listensock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
-    if (listensock < 0) error("ERROR opening socket");
+    if (listensock < 0) printerror("ERROR opening socket");
 
     bzero((char*)&serv_addr, sizeof(serv_addr));
     serv_addr.sin_family = AF_INET;
     serv_addr.sin_addr.s_addr = INADDR_ANY;
     serv_addr.sin_port = htons(port);
     if (bind(listensock, (struct sockaddr*)&serv_addr, sizeof(serv_addr)) < 0)
-        error("ERROR on binding");
+        printerror("ERROR on binding");
 
     fprintf(stderr, "listening on port %i...\n", port);
     listen(listensock, 1);
     socklen_t clilen;
     struct sockaddr_in cli_addr;
     sockfd = accept(listensock, (struct sockaddr*)&cli_addr, &clilen);
-    if (sockfd < 0) error("error on accept");
+    if (sockfd < 0) printerror("error on accept");
     close(listensock);
     fprintf(stderr, "connection made, starting session...\n");
 
@@ -84,49 +139,68 @@ int initServerNet(int port)
     dhGenk(&serverEphemeralKey); // Generate ephemeral key
 
     // Step 2: Send the server's public keys to the client
-    serialize_mpz(sockfd, serverLongTermKey.PK); // Send long-term public key
-    serialize_mpz(sockfd, serverEphemeralKey.PK); // Send ephemeral public key
+    serialize_mpz(sockfd, serverLongTermKey.PK);    // Send long-term public key
+    serialize_mpz(sockfd, serverEphemeralKey.PK);   // Send ephemeral public key
 
     // Step 3: Receive the client's public keys
     dhKey clientLongTermKey, clientEphemeralKey;
     initKey(&clientLongTermKey);
     initKey(&clientEphemeralKey);
-    deserialize_mpz(clientLongTermKey.PK, sockfd); // Receive client's long-term public key
+    deserialize_mpz(clientLongTermKey.PK, sockfd);  // Receive client's long-term public key
     deserialize_mpz(clientEphemeralKey.PK, sockfd); // Receive client's ephemeral public key
 
     // Step 4: Compute the shared secret using dh3Final()
-const size_t sharedKeyLen = 32; // Length of the shared secret key in bytes
-unsigned char tempSharedSecret[sharedKeyLen];
-dh3Final(serverLongTermKey.SK, serverLongTermKey.PK, serverEphemeralKey.SK, serverEphemeralKey.PK, 
-         clientLongTermKey.PK, clientEphemeralKey.PK, tempSharedSecret, sharedKeyLen);
+    const size_t sharedKeyLen = 32; // Length of the shared secret key in bytes
+    unsigned char tempSharedSecret[sharedKeyLen];
+    dh3Final(serverLongTermKey.SK, serverLongTermKey.PK, serverEphemeralKey.SK, serverEphemeralKey.PK,
+             clientLongTermKey.PK, clientEphemeralKey.PK, tempSharedSecret, sharedKeyLen);
 
-// Copy the shared secret into the global sharedSecret variable
-memcpy(sharedSecret, tempSharedSecret, sharedKeyLen);
+    // Copy the shared secret into the global sharedSecret variable
+    memcpy(sharedSecret, tempSharedSecret, sharedKeyLen);
 
-// Clean up keys
-shredKey(&serverLongTermKey);
-shredKey(&serverEphemeralKey);
-shredKey(&clientLongTermKey);
-shredKey(&clientEphemeralKey);
-/*
-	HERE IS THE TEST TO CONFIRM DIFFIE HELLMEN IS WORKING FOR THE SERVER 
-// After computing the shared secret in initClientNet() or initServerNet()
-printf("Shared secret (hex): ");
-for (int i = 0; i < sharedKeyLen; i++) {
-    printf("%02x", sharedSecret[i]);
-}
-printf("\n");
-*/
+    // Step 5: Derive separate encryption and HMAC keys from the shared secret using HKDF
+    unsigned char prk[HASH_LEN];  // Pseudorandom Key (PRK)
 
-return 0;
+    // HKDF-Extract: Derive PRK from the shared secret
+    hkdf_extract(NULL, 0, tempSharedSecret, sharedKeyLen, prk);
+
+    // HKDF-Expand: Derive encryption key (for AES encryption)
+    hkdf_expand(prk, HASH_LEN, (unsigned char *)"encryption", strlen("encryption"), encryptionKey, AES_KEY_LENGTH);
+
+    // HKDF-Expand: Derive HMAC key (for message authentication)
+    hkdf_expand(prk, HASH_LEN, (unsigned char *)"hmac", strlen("hmac"), hmacKey, HMAC_LENGTH);
+
+    // Step 6: Clean up sensitive data
+    OPENSSL_cleanse(tempSharedSecret, sharedKeyLen); // Erase temporary shared secret
+    OPENSSL_cleanse(prk, HASH_LEN);                  // Erase PRK
+
+    // Clean up keys
+    shredKey(&serverLongTermKey);
+    shredKey(&serverEphemeralKey);
+    shredKey(&clientLongTermKey);
+    shredKey(&clientEphemeralKey);
+
+    /*
+        HERE IS THE TEST TO CONFIRM DIFFIE-HELLMAN IS WORKING FOR THE SERVER
+        Uncomment for testing purposes:
+
+        // After computing the shared secret in initClientNet() or initServerNet()
+        printf("Shared secret (hex): ");
+        for (int i = 0; i < sharedKeyLen; i++) {
+            printf("%02x", sharedSecret[i]);
+        }
+        printf("\n");
+    */
+
+    return 0;
 }
 //=================================================================================================================================
 static int initClientNet(char* hostname, int port)
 {
-	struct sockaddr_in serv_addr;
+    struct sockaddr_in serv_addr;
     sockfd = socket(AF_INET, SOCK_STREAM, 0);
     struct hostent *server;
-    if (sockfd < 0) error("ERROR opening socket");
+    if (sockfd < 0) printerror("ERROR opening socket");
     server = gethostbyname(hostname);
     if (server == NULL) {
         fprintf(stderr, "ERROR, no such host\n");
@@ -137,7 +211,7 @@ static int initClientNet(char* hostname, int port)
     memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
     serv_addr.sin_port = htons(port);
     if (connect(sockfd, (struct sockaddr *) &serv_addr, sizeof(serv_addr)) < 0)
-        error("ERROR connecting");
+        printerror("ERROR connecting");
     
     fprintf(stderr, "Connected to server on port %i...\n", port);
 
@@ -156,35 +230,51 @@ static int initClientNet(char* hostname, int port)
     deserialize_mpz(serverEphemeralKey.PK, sockfd); // Receive server's ephemeral public key
 
     // Step 3: Send the client's public keys to the server
-    serialize_mpz(sockfd, clientLongTermKey.PK); // Send long-term public key
-    serialize_mpz(sockfd, clientEphemeralKey.PK); // Send ephemeral public key
+    serialize_mpz(sockfd, clientLongTermKey.PK);    // Send long-term public key
+    serialize_mpz(sockfd, clientEphemeralKey.PK);   // Send ephemeral public key
 
     // Step 4: Compute the shared secret using dh3Final()
-const size_t sharedKeyLen = 32; // Length of the shared secret key in bytes
-unsigned char tempSharedSecret[sharedKeyLen];
-dh3Final(clientLongTermKey.SK, clientLongTermKey.PK, clientEphemeralKey.SK, clientEphemeralKey.PK,
-         serverLongTermKey.PK, serverEphemeralKey.PK, tempSharedSecret, sharedKeyLen);
+    const size_t sharedKeyLen = 32; // Length of the shared secret key in bytes
+    unsigned char tempSharedSecret[sharedKeyLen];
+    dh3Final(clientLongTermKey.SK, clientLongTermKey.PK, clientEphemeralKey.SK, clientEphemeralKey.PK,
+             serverLongTermKey.PK, serverEphemeralKey.PK, tempSharedSecret, sharedKeyLen);
 
-// Copy the shared secret into the global sharedSecret variable
-memcpy(sharedSecret, tempSharedSecret, sharedKeyLen);
+    // Copy the shared secret into the global sharedSecret variable
+    memcpy(sharedSecret, tempSharedSecret, sharedKeyLen);
 
-// Clean up keys
-shredKey(&clientLongTermKey);
-shredKey(&clientEphemeralKey);
-shredKey(&serverLongTermKey);
-shredKey(&serverEphemeralKey);
+    // Step 5: Derive separate encryption and HMAC keys from the shared secret using HKDF
+    unsigned char prk[HASH_LEN];  // Pseudorandom Key (PRK)
 
-/*
-	HERE IS THE TEST TO CONFIRM DIFFIE HELLMEN IS WORKING FOR THE CLIENT 
+    // HKDF-Extract: Derive PRK from the shared secret
+    hkdf_extract(NULL, 0, tempSharedSecret, sharedKeyLen, prk);
 
-// After computing the shared secret in initClientNet() or initServerNet()
-printf("Shared secret (hex): ");
-for (int i = 0; i < sharedKeyLen; i++) {
-    printf("%02x", sharedSecret[i]);
-}
-printf("\n");
-*/
+    // HKDF-Expand: Derive encryption key (for AES encryption)
+    hkdf_expand(prk, HASH_LEN, (unsigned char *)"encryption", strlen("encryption"), encryptionKey, AES_KEY_LENGTH);
 
+    // HKDF-Expand: Derive HMAC key (for message authentication)
+    hkdf_expand(prk, HASH_LEN, (unsigned char *)"hmac", strlen("hmac"), hmacKey, HMAC_LENGTH);
+
+    // Step 6: Clean up sensitive data
+    OPENSSL_cleanse(tempSharedSecret, sharedKeyLen); // Erase temporary shared secret
+    OPENSSL_cleanse(prk, HASH_LEN);                  // Erase PRK
+
+    // Clean up keys
+    shredKey(&clientLongTermKey);
+    shredKey(&clientEphemeralKey);
+    shredKey(&serverLongTermKey);
+    shredKey(&serverEphemeralKey);
+
+    /*
+        HERE IS THE TEST TO CONFIRM DIFFIE-HELLMAN IS WORKING FOR THE CLIENT
+        Uncomment for testing purposes:
+
+        // After computing the shared secret in initClientNet() or initServerNet()
+        printf("Shared secret (hex): ");
+        for (int i = 0; i < sharedKeyLen; i++) {
+            printf("%02x", sharedSecret[i]);
+        }
+        printf("\n");
+    */
 
     return 0;
 }
@@ -261,40 +351,40 @@ static void encryptAndSendMessage(const unsigned char* sharedSecret, const char*
 
     // Step 1: Generate a random IV
     if (RAND_bytes(iv, AES_BLOCK_SIZE) != 1) {
-        error("IV generation failed");
+        printerror("IV generation failed");
     }
 
-    // Allocate memory for ciphertext
+    // Allocate memory for ciphertext, ensure it's big enough for any size of plaintext
     ciphertext = malloc(plaintextLen + AES_BLOCK_SIZE); // Extra space for safety
     if (!ciphertext) {
-        error("Failed to allocate memory for ciphertext");
+        printerror("Failed to allocate memory for ciphertext");
     }
 
     // Step 2: Encrypt the plaintext using AES in CTR mode
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
         free(ciphertext);
-        error("Failed to create encryption context");
+        printerror("Failed to create encryption context");
     }
 
     if (EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, sharedSecret, iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         free(ciphertext);
-        error("Encryption initialization failed");
+        printerror("Encryption initialization failed");
     }
 
     int len;
     if (EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char*)plaintext, plaintextLen) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         free(ciphertext);
-        error("Encryption failed");
+        printerror("Encryption failed");
     }
     ciphertextLen = len;
 
     if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         free(ciphertext);
-        error("Final encryption step failed");
+        printerror("Final encryption step failed");
     }
     ciphertextLen += len;
     EVP_CIPHER_CTX_free(ctx);
@@ -302,27 +392,7 @@ static void encryptAndSendMessage(const unsigned char* sharedSecret, const char*
     // Step 3: Generate HMAC for the ciphertext
     HMAC(EVP_sha256(), sharedSecret, AES_KEY_LENGTH, ciphertext, ciphertextLen, hmac, NULL);
 
-
-/* TEST FUNCTION TO CHECK IF ENCRYPTED PROPERLY
-
-	printf("Original plaintext: %s\n", plaintext);
-printf("Ciphertext (hex): ");
-for (int i = 0; i < ciphertextLen; i++) {
-    printf("%02x", ciphertext[i]);
-}
-printf("\n");
-*/
-
-/* TEST FUNCTION TO CHECK IF HMAC IS WORKING PROPERLY 
-// Print the HMAC value for testing
-printf("Generated HMAC (hex): ");
-for (int i = 0; i < HMAC_LENGTH; i++) {
-    printf("%02x", hmac[i]);
-}
-printf("\n");
-*/
-
- // Step 4: Send the message size, IV, ciphertext, and HMAC
+    // Step 4: Send the message size, IV, ciphertext, and HMAC
     uint32_t netMessageSize = htonl(ciphertextLen);
     xwrite(sockfd, &netMessageSize, sizeof(netMessageSize)); // Send message size in network byte order
     xwrite(sockfd, iv, AES_BLOCK_SIZE);                      // Send IV
@@ -332,7 +402,6 @@ printf("\n");
     // Clean up
     free(ciphertext);
 }
-
 
 //=================================================================================================================================
 
@@ -344,27 +413,63 @@ static void sendMessage(GtkWidget* w, gpointer data)
     GtkTextIter mend;
     gtk_text_buffer_get_start_iter(mbuf, &mstart);
     gtk_text_buffer_get_end_iter(mbuf, &mend);
+    
     char* message = gtk_text_buffer_get_text(mbuf, &mstart, &mend, 1);
-    tsappend(message, NULL, 1);
+    size_t messageLen = strlen(message);
+
+    if (messageLen == 0) {
+        free(message);
+        return;
+    }
+
+    // Ensure the message is within the valid length range
+    if (messageLen > MAX_PLAINTEXT_LENGTH) {
+        fprintf(stderr, "Message is too long.\n");
+        free(message);
+        return;
+    }
 
     // Encrypt and send the message
     encryptAndSendMessage(sharedSecret, message);
 
+    // Append the message to the transcript
+    tsappend(message, NULL, 1);
+
+    // Free the dynamically allocated message and reset the input buffer
     free(message);
     gtk_text_buffer_delete(mbuf, &mstart, &mend);
     gtk_widget_grab_focus(w);
 }
 
+
 static gboolean shownewmessage(gpointer msg)
 {
-	char* tags[2] = {"friend",NULL};
-	char* friendname = "mr. friend: ";
-	tsappend(friendname,tags,0);
-	char* message = (char*)msg;
-	tsappend(message,NULL,1);
-	free(message);
-	return 0;
+    char* tags[2] = {"friend", NULL};
+    char* friendname = "mr. friend: ";
+    
+    // Append the sender's name to the transcript
+    tsappend(friendname, tags, 0);
+    
+    char* message = (char*)msg;
+    size_t msgLen = strlen(message);
+
+    // Check if the message length is within valid range
+    if (msgLen > MAX_MESSAGE_SIZE) {
+        fprintf(stderr, "Received message is too long.\n");
+        free(message);
+        return FALSE;
+    }
+
+    // Append the received message to the transcript
+    tsappend(message, NULL, 1);
+    
+    // Free the message as it's no longer needed
+    free(message);
+    
+    return FALSE;
 }
+
+
 //==================================================================================================================================
 
 static int decryptMessage(const unsigned char* sharedSecret, const unsigned char* iv, 
@@ -374,6 +479,7 @@ static int decryptMessage(const unsigned char* sharedSecret, const unsigned char
     // Step 1: Verify HMAC
     unsigned char computedHmac[HMAC_LENGTH];
     HMAC(EVP_sha256(), sharedSecret, AES_KEY_LENGTH, ciphertext, ciphertextLen, computedHmac, NULL);
+    
     if (CRYPTO_memcmp(computedHmac, receivedHmac, HMAC_LENGTH) != 0) {
         fprintf(stderr, "HMAC verification failed.\n");
         return -1; // Integrity check failed
@@ -382,19 +488,20 @@ static int decryptMessage(const unsigned char* sharedSecret, const unsigned char
     // Step 2: Decrypt the ciphertext using AES in CTR mode
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
-        error("Failed to create decryption context");
+        printerror("Failed to create decryption context");
     }
 
     if (EVP_DecryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, sharedSecret, iv) != 1) {
         EVP_CIPHER_CTX_free(ctx);
-        error("Decryption initialization failed");
+        printerror("Decryption initialization failed");
     }
 
     int len;
     int plaintextLen = 0;
+
     if (EVP_DecryptUpdate(ctx, (unsigned char*)plaintext, &len, ciphertext, ciphertextLen) != 1) {
         EVP_CIPHER_CTX_free(ctx);
-        error("Decryption failed");
+        printerror("Decryption failed");
     }
     plaintextLen += len;
 
@@ -406,7 +513,7 @@ static int decryptMessage(const unsigned char* sharedSecret, const unsigned char
 
     if (EVP_DecryptFinal_ex(ctx, (unsigned char*)plaintext + plaintextLen, &len) != 1) {
         EVP_CIPHER_CTX_free(ctx);
-        error("Final decryption step failed");
+        printerror("Final decryption step failed");
     }
     plaintextLen += len;
 
@@ -420,30 +527,8 @@ static int decryptMessage(const unsigned char* sharedSecret, const unsigned char
 
     // Null-terminate the plaintext
     plaintext[plaintextLen] = '\0';
-/* TEST FUNCTION TO CHECK IF DECRYPTED PROPERLY
-	if (plaintextLen >= 0) {
-    printf("Decrypted plaintext: %s\n", plaintext);
-}
-*/
 
-
-/* TEST FUNCTION TO CHECK IF HMAC IS WORKING PROPERLY
-// Print the received and computed HMAC values for testing
-printf("Received HMAC (hex): ");
-for (int i = 0; i < HMAC_LENGTH; i++) {
-    printf("%02x", receivedHmac[i]);
-}
-printf("\n");
-
-printf("Computed HMAC (hex): ");
-for (int i = 0; i < HMAC_LENGTH; i++) {
-    printf("%02x", computedHmac[i]);
-}
-printf("\n");
-
-*/
-
-    return plaintextLen;
+    return plaintextLen; // Return the length of the decrypted message
 }
 
 //=============================================================================================================================
@@ -540,6 +625,14 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Failed to create update thread.\n");
 	}
 
+    /* printf("Running Diffie-Hellman test...\n");
+    test_diffie_hellman();
+
+    printf("Running Encrypt/Decrypt test...\n");
+    test_encrypt_decrypt();
+
+    */ 
+
 	gtk_main();
 
 	shutdownNetwork();
@@ -560,7 +653,7 @@ void* recvMsg(void* arg) {
         // Step 1: Receive the message size (always 4 bytes)
         nbytes = recvAll(sockfd, &netMessageSize, sizeof(netMessageSize));
         if (nbytes != sizeof(netMessageSize)) {
-            error("Failed to receive message size");
+            printerror("Failed to receive message size");
             break;
         }
 
@@ -576,14 +669,14 @@ void* recvMsg(void* arg) {
         // Step 2: Receive the IV
         nbytes = recvAll(sockfd, iv, AES_BLOCK_SIZE);
         if (nbytes != AES_BLOCK_SIZE) {
-            error("Failed to receive IV");
+            printerror("Failed to receive IV");
             break;
         }
 
         // Step 3: Allocate buffer for ciphertext based on message size
         unsigned char* ciphertext = malloc(messageSize);
         if (!ciphertext) {
-            error("Failed to allocate memory for ciphertext");
+            printerror("Failed to allocate memory for ciphertext");
             break;
         }
 
@@ -591,7 +684,7 @@ void* recvMsg(void* arg) {
         nbytes = recvAll(sockfd, ciphertext, messageSize);
         if (nbytes != (ssize_t)messageSize) {
             free(ciphertext);
-            error("Failed to receive complete ciphertext");
+            printerror("Failed to receive complete ciphertext");
             break;
         }
 
@@ -599,7 +692,7 @@ void* recvMsg(void* arg) {
         nbytes = recvAll(sockfd, hmac, HMAC_LENGTH);
         if (nbytes != HMAC_LENGTH) {
             free(ciphertext);
-            error("Failed to receive HMAC");
+            printerror("Failed to receive HMAC");
             break;
         }
 
@@ -608,7 +701,7 @@ void* recvMsg(void* arg) {
         char* plaintext = malloc(plaintextBufferSize);
         if (!plaintext) {
             free(ciphertext);
-            error("Failed to allocate memory for plaintext");
+            printerror("Failed to allocate memory for plaintext");
             break;
         }
 
@@ -644,3 +737,128 @@ ssize_t recvAll(int sockfd, void* buffer, size_t length) {
     }
     return totalReceived;
 }
+
+
+
+
+
+
+
+
+
+
+//--------------------- TEST FUNCTIONS-------------------------------------------------------------
+
+/*
+void test_diffie_hellman()
+{
+    // Step 1: Generate long-term and ephemeral key pairs for both client and server
+    dhKey clientLongTermKey, clientEphemeralKey;
+    dhKey serverLongTermKey, serverEphemeralKey;
+
+    initKey(&clientLongTermKey);
+    initKey(&clientEphemeralKey);
+    initKey(&serverLongTermKey);
+    initKey(&serverEphemeralKey);
+
+    dhGenk(&clientLongTermKey);  // Client long-term key
+    dhGenk(&clientEphemeralKey); // Client ephemeral key
+    dhGenk(&serverLongTermKey);  // Server long-term key
+    dhGenk(&serverEphemeralKey); // Server ephemeral key
+
+    // Step 2: Compute the shared secret for both client and server
+    const size_t sharedKeyLen = 32; // Length of the shared secret key in bytes
+    unsigned char clientSharedSecret[sharedKeyLen];
+    unsigned char serverSharedSecret[sharedKeyLen];
+
+    dh3Final(clientLongTermKey.SK, clientLongTermKey.PK, clientEphemeralKey.SK, clientEphemeralKey.PK,
+             serverLongTermKey.PK, serverEphemeralKey.PK, clientSharedSecret, sharedKeyLen);
+
+    dh3Final(serverLongTermKey.SK, serverLongTermKey.PK, serverEphemeralKey.SK, serverEphemeralKey.PK,
+             clientLongTermKey.PK, clientEphemeralKey.PK, serverSharedSecret, sharedKeyLen);
+
+    // Step 3: Compare the shared secrets
+    if (memcmp(clientSharedSecret, serverSharedSecret, sharedKeyLen) == 0) {
+        printf("Diffie-Hellman test passed. Both sides computed the same shared secret.\n");
+    } else {
+        printf("Diffie-Hellman test failed. Shared secrets do not match.\n");
+    }
+
+    // Clean up
+    shredKey(&clientLongTermKey);
+    shredKey(&clientEphemeralKey);
+    shredKey(&serverLongTermKey);
+    shredKey(&serverEphemeralKey);
+}
+
+
+//------------------------------------------------------------------------------------------------------------------
+
+
+void test_encrypt_decrypt()
+{
+    // Sample plaintext
+    const char *plaintext = "This is a test message.";
+    size_t plaintextLen = strlen(plaintext);
+
+    // Generate shared secret
+    unsigned char sharedSecret[32] = {0x1, 0x2, 0x3, 0x4}; // Use a dummy shared secret for testing purposes
+
+    // Encrypt the message
+    unsigned char iv[AES_BLOCK_SIZE];
+    unsigned char *ciphertext = malloc(plaintextLen + AES_BLOCK_SIZE); // Allocate enough space
+    unsigned char hmac[HMAC_LENGTH];
+    int ciphertextLen;
+
+    // Step 1: Generate a random IV
+    if (RAND_bytes(iv, AES_BLOCK_SIZE) != 1) {
+        printf("IV generation failed\n");
+        return;
+    }
+
+    // Step 2: Encrypt the message
+    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+        printf("Failed to create encryption context\n");
+        return;
+    }
+
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_ctr(), NULL, sharedSecret, iv) != 1) {
+        printf("Encryption initialization failed\n");
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+
+    int len;
+    if (EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char *)plaintext, plaintextLen) != 1) {
+        printf("Encryption failed\n");
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+    ciphertextLen = len;
+
+    if (EVP_EncryptFinal_ex(ctx, ciphertext + len, &len) != 1) {
+        printf("Final encryption step failed\n");
+        EVP_CIPHER_CTX_free(ctx);
+        return;
+    }
+    ciphertextLen += len;
+    EVP_CIPHER_CTX_free(ctx);
+
+    // Step 3: Generate HMAC
+    HMAC(EVP_sha256(), sharedSecret, AES_KEY_LENGTH, ciphertext, ciphertextLen, hmac, NULL);
+
+    // Decrypt the message
+    char decryptedText[MAX_PLAINTEXT_LENGTH];
+    int decryptedLen = decryptMessage(sharedSecret, iv, ciphertext, ciphertextLen, hmac, decryptedText, MAX_PLAINTEXT_LENGTH);
+
+    if (decryptedLen >= 0) {
+        printf("Decryption successful: %s\n", decryptedText);
+    } else {
+        printf("Decryption failed.\n");
+    }
+
+    free(ciphertext);
+}
+
+*/
