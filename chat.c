@@ -1,6 +1,7 @@
 #define MAX_MESSAGE_SIZE 65536 // 64 KB or another appropriate value
 #define MAX_PLAINTEXT_LENGTH 65536 // or any appropriate value, similar to MAX_MESSAGE_SIZE
 #define HASH_LEN 32  // SHA256 produces 32 bytes of output
+#define MAX_TRANSCRIPT_LENGTH 1024  // or any appropriate value
 
 #include <gtk/gtk.h>
 #include <glib/gunicode.h> /* for utf8 strlen */
@@ -334,11 +335,12 @@ static void tsappend(char* message, char** tagnames, int ensurenewline)
 }
 
 //=================================================================================================================================
+static uint32_t sequenceNumber = 0; // Global variable for tracking sequence number
 
 static void encryptAndSendMessage(const unsigned char* sharedSecret, const char* plaintext) {
     size_t plaintextLen = strlen(plaintext);
 
-    // Limit the size of the plaintext
+    // Check plaintext length validity
     if (plaintextLen == 0 || plaintextLen > MAX_PLAINTEXT_LENGTH) {
         fprintf(stderr, "Invalid plaintext length.\n");
         return;
@@ -349,18 +351,24 @@ static void encryptAndSendMessage(const unsigned char* sharedSecret, const char*
     unsigned char hmac[HMAC_LENGTH];
     int ciphertextLen;
 
-    // Step 1: Generate a random IV
+    // Step 1: Generate random IV
     if (RAND_bytes(iv, AES_BLOCK_SIZE) != 1) {
         printerror("IV generation failed");
     }
 
-    // Allocate memory for ciphertext, ensure it's big enough for any size of plaintext
-    ciphertext = malloc(plaintextLen + AES_BLOCK_SIZE); // Extra space for safety
+    // Allocate memory for ciphertext and include sequence number
+    size_t totalCiphertextSize = plaintextLen + sizeof(sequenceNumber); // Ensure space for sequence number
+    ciphertext = malloc(totalCiphertextSize);
     if (!ciphertext) {
         printerror("Failed to allocate memory for ciphertext");
     }
 
-    // Step 2: Encrypt the plaintext using AES in CTR mode
+    // Step 2: Add sequence number to the plaintext before encryption
+    memcpy(ciphertext, &sequenceNumber, sizeof(sequenceNumber)); // Add sequence number
+    memcpy(ciphertext + sizeof(sequenceNumber), plaintext, plaintextLen);
+    plaintextLen += sizeof(sequenceNumber); // Update plaintext length to include sequence number
+
+    // Step 3: Encrypt plaintext using AES in CTR mode
     EVP_CIPHER_CTX* ctx = EVP_CIPHER_CTX_new();
     if (!ctx) {
         free(ciphertext);
@@ -374,7 +382,7 @@ static void encryptAndSendMessage(const unsigned char* sharedSecret, const char*
     }
 
     int len;
-    if (EVP_EncryptUpdate(ctx, ciphertext, &len, (unsigned char*)plaintext, plaintextLen) != 1) {
+    if (EVP_EncryptUpdate(ctx, ciphertext, &len, ciphertext, plaintextLen) != 1) {
         EVP_CIPHER_CTX_free(ctx);
         free(ciphertext);
         printerror("Encryption failed");
@@ -389,17 +397,20 @@ static void encryptAndSendMessage(const unsigned char* sharedSecret, const char*
     ciphertextLen += len;
     EVP_CIPHER_CTX_free(ctx);
 
-    // Step 3: Generate HMAC for the ciphertext
+    // Step 4: Generate HMAC for the ciphertext
     HMAC(EVP_sha256(), sharedSecret, AES_KEY_LENGTH, ciphertext, ciphertextLen, hmac, NULL);
 
-    // Step 4: Send the message size, IV, ciphertext, and HMAC
+    // Step 5: Send message size, IV, ciphertext, and HMAC
     uint32_t netMessageSize = htonl(ciphertextLen);
-    xwrite(sockfd, &netMessageSize, sizeof(netMessageSize)); // Send message size in network byte order
+    xwrite(sockfd, &netMessageSize, sizeof(netMessageSize)); // Send message size
     xwrite(sockfd, iv, AES_BLOCK_SIZE);                      // Send IV
     xwrite(sockfd, ciphertext, ciphertextLen);               // Send ciphertext
     xwrite(sockfd, hmac, HMAC_LENGTH);                       // Send HMAC
 
-    // Clean up
+    // Increment sequence number for next message
+    sequenceNumber++;
+
+    // Clean up memory
     free(ciphertext);
 }
 
@@ -415,16 +426,17 @@ static void sendMessage(GtkWidget* w, gpointer data)
     gtk_text_buffer_get_end_iter(mbuf, &mend);
     
     char* message = gtk_text_buffer_get_text(mbuf, &mstart, &mend, 1);
-    size_t messageLen = strlen(message);
 
-    if (messageLen == 0) {
-        free(message);
+    // Check for NULL message
+    if (message == NULL) {
         return;
     }
 
+    size_t messageLen = strlen(message);
+    
     // Ensure the message is within the valid length range
-    if (messageLen > MAX_PLAINTEXT_LENGTH) {
-        fprintf(stderr, "Message is too long.\n");
+    if (messageLen == 0 || messageLen > MAX_PLAINTEXT_LENGTH) {
+        fprintf(stderr, "Message is too long or empty.\n");
         free(message);
         return;
     }
@@ -432,8 +444,12 @@ static void sendMessage(GtkWidget* w, gpointer data)
     // Encrypt and send the message
     encryptAndSendMessage(sharedSecret, message);
 
-    // Append the message to the transcript
-    tsappend(message, NULL, 1);
+    // Append the message to the transcript with a safety check
+    if (messageLen <= MAX_TRANSCRIPT_LENGTH) {
+        tsappend(message, NULL, 1);
+    } else {
+        fprintf(stderr, "Message too long to append to transcript.\n");
+    }
 
     // Free the dynamically allocated message and reset the input buffer
     free(message);
@@ -472,6 +488,7 @@ static gboolean shownewmessage(gpointer msg)
 
 //==================================================================================================================================
 
+static uint32_t lastSequenceNumber = 0; //Here we are tracking the last sequence received
 static int decryptMessage(const unsigned char* sharedSecret, const unsigned char* iv, 
                           const unsigned char* ciphertext, size_t ciphertextLen, 
                           const unsigned char* receivedHmac, char* plaintext, size_t plaintextBufferSize) 
@@ -479,7 +496,7 @@ static int decryptMessage(const unsigned char* sharedSecret, const unsigned char
     // Step 1: Verify HMAC
     unsigned char computedHmac[HMAC_LENGTH];
     HMAC(EVP_sha256(), sharedSecret, AES_KEY_LENGTH, ciphertext, ciphertextLen, computedHmac, NULL);
-    
+
     if (CRYPTO_memcmp(computedHmac, receivedHmac, HMAC_LENGTH) != 0) {
         fprintf(stderr, "HMAC verification failed.\n");
         return -1; // Integrity check failed
@@ -498,38 +515,86 @@ static int decryptMessage(const unsigned char* sharedSecret, const unsigned char
 
     int len;
     int plaintextLen = 0;
+    unsigned char* fullPlaintext = malloc(ciphertextLen);
+    if (!fullPlaintext) {
+        printerror("Memory allocation for fullPlaintext failed");
+    }
 
-    if (EVP_DecryptUpdate(ctx, (unsigned char*)plaintext, &len, ciphertext, ciphertextLen) != 1) {
+    if (EVP_DecryptUpdate(ctx, fullPlaintext, &len, ciphertext, ciphertextLen) != 1) {
         EVP_CIPHER_CTX_free(ctx);
+        free(fullPlaintext);
         printerror("Decryption failed");
     }
     plaintextLen += len;
 
-    if ((size_t)plaintextLen >= plaintextBufferSize) {
+    if (EVP_DecryptFinal_ex(ctx, fullPlaintext + len, &len) != 1) {
         EVP_CIPHER_CTX_free(ctx);
-        fprintf(stderr, "Decrypted plaintext too large for buffer\n");
-        return -1;
-    }
-
-    if (EVP_DecryptFinal_ex(ctx, (unsigned char*)plaintext + plaintextLen, &len) != 1) {
-        EVP_CIPHER_CTX_free(ctx);
+        free(fullPlaintext);
         printerror("Final decryption step failed");
     }
     plaintextLen += len;
+    EVP_CIPHER_CTX_free(ctx);
 
-    if ((size_t)plaintextLen >= plaintextBufferSize) {
-        EVP_CIPHER_CTX_free(ctx);
-        fprintf(stderr, "Decrypted plaintext too large for buffer\n");
+    // Step 3: Extract sequence number from decrypted message
+    uint32_t receivedSequenceNumber;
+    memcpy(&receivedSequenceNumber, fullPlaintext, sizeof(receivedSequenceNumber));
+
+    // Step 4: Fix 1 - Allow the first message to go through if lastSequenceNumber is 0
+    if (receivedSequenceNumber == 0 && lastSequenceNumber == 0) {
+        lastSequenceNumber = receivedSequenceNumber;  // Allow first message, no replay check
+    }
+    // Step 5: Fix 2 - Regular replay attack check for subsequent messages
+    else if (receivedSequenceNumber <= lastSequenceNumber) {
+        fprintf(stderr, "Replay attack detected!\n");
+        free(fullPlaintext);
         return -1;
     }
 
-    EVP_CIPHER_CTX_free(ctx);
+    // Update last valid sequence number
+    lastSequenceNumber = receivedSequenceNumber;
 
-    // Null-terminate the plaintext
-    plaintext[plaintextLen] = '\0';
+    // Step 6: Copy decrypted message (without sequence number) to plaintext buffer
+    size_t actualPlaintextLen = plaintextLen - sizeof(receivedSequenceNumber);
+    if (actualPlaintextLen >= plaintextBufferSize) {
+        fprintf(stderr, "Decrypted plaintext too large for buffer\n");
+        free(fullPlaintext);
+        return -1;
+    }
 
-    return plaintextLen; // Return the length of the decrypted message
+    memcpy(plaintext, fullPlaintext + sizeof(receivedSequenceNumber), actualPlaintextLen);
+    plaintext[actualPlaintextLen] = '\0';
+
+    // Clean up
+    free(fullPlaintext);
+    return actualPlaintextLen; // Return length of decrypted message
 }
+
+
+    // if ((size_t)plaintextLen >= plaintextBufferSize) {
+    //     EVP_CIPHER_CTX_free(ctx);
+    //     fprintf(stderr, "Decrypted plaintext too large for buffer\n");
+    //     return -1;
+    // }
+
+    // if (EVP_DecryptFinal_ex(ctx, (unsigned char*)plaintext + plaintextLen, &len) != 1) {
+    //     EVP_CIPHER_CTX_free(ctx);
+    //     printerror("Final decryption step failed");
+    // }
+    // plaintextLen += len;
+
+    // if ((size_t)plaintextLen >= plaintextBufferSize) {
+    //     EVP_CIPHER_CTX_free(ctx);
+    //     fprintf(stderr, "Decrypted plaintext too large for buffer\n");
+    //     return -1;
+    // }
+
+    // EVP_CIPHER_CTX_free(ctx);
+
+    // // Null-terminate the plaintext
+    // plaintext[plaintextLen] = '\0';
+
+    // return plaintextLen; // Return the length of the decrypted message
+
 
 //=============================================================================================================================
 
@@ -859,6 +924,50 @@ void test_encrypt_decrypt()
     }
 
     free(ciphertext);
+}---------------------------------------TEST FUNCTION REPLAY ATTACK --------------------------------------------------
+
+void testReplayAttack() {
+    const unsigned char sharedSecret[AES_KEY_LENGTH] = "0123456789abcdef0123456789abcdef";
+    const char* message = "Hello, this is a test message.";
+
+    unsigned char iv[AES_BLOCK_SIZE];
+    unsigned char ciphertext[MAX_PLAINTEXT_LENGTH + sizeof(uint32_t)];  // Account for sequence number
+    unsigned char hmac[HMAC_LENGTH];
+    char plaintext[MAX_PLAINTEXT_LENGTH];
+    int ciphertextLen;
+
+    encryptAndSendMessage(sharedSecret, message);
+
+    ciphertextLen = strlen(message) + AES_BLOCK_SIZE + sizeof(uint32_t);  // Adjust for the sequence number
+    if (decryptMessage(sharedSecret, iv, ciphertext, ciphertextLen, hmac, plaintext, MAX_PLAINTEXT_LENGTH) < 0) {
+        printf("Decryption failed for the first message.\n");
+        return;
+    }
+
+    //Replay the same message (now this should fail here)
+    printf("Testing replay attack:\n");
+    if (decryptMessage(sharedSecret, iv, ciphertext, ciphertextLen, hmac, plaintext, MAX_PLAINTEXT_LENGTH) < 0) {
+        printf("Replay attack successfully detected!\n");
+    } else {
+        printf("Replay attack failed to be detected!\n");
+    }
+}----------------------------------------TEST FUNCTION BUFFER OVERFLOW ------------------------------------------------------
+
+
+void testBufferOverflow() {
+    const unsigned char sharedSecret[AES_KEY_LENGTH] = "0123456789abcdef0123456789abcdef";
+    char longMessage[MAX_PLAINTEXT_LENGTH + 10]; // here, this is longer than the allowed length
+    memset(longMessage, 'A', sizeof(longMessage) - 1);
+    longMessage[sizeof(longMessage) - 1] = '\0'; // Null-terminate
+
+    printf("Testing buffer overflow prevention:\n");
+
+    if (encryptAndSendMessage(sharedSecret, longMessage) < 0) {
+        printf("Buffer overflow successfully prevented!\n");
+    } else {
+        printf("Buffer overflow failed to be detected!\n");
+    }
 }
+
 
 */
