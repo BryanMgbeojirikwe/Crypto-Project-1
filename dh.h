@@ -1,3 +1,4 @@
+//Authors: Bryan Mgbeojirikwe, Tanzila Tabassum, Maimouna Traore
 /* Diffie Hellman key exchange + HKDF */
 #pragma once
 #include <gmp.h>
