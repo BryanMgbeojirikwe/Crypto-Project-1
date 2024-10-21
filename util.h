@@ -1,3 +1,4 @@
+//Authors: Bryan Mgbeojirikwe, Tanzila Tabassum, Maimouna Traore
 #pragma once
 #include <gmp.h>
 /* convenience macros */
