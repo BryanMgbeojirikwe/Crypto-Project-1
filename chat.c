@@ -1,3 +1,5 @@
+//Authors: Bryan Mgbeojirikwe, Tanzila Tabassum, Maimouna Traore
+
 #define MAX_MESSAGE_SIZE 65536 // 64 KB or another appropriate value
 #define MAX_PLAINTEXT_LENGTH 65536 // or any appropriate value, similar to MAX_MESSAGE_SIZE
 #define HASH_LEN 32  // SHA256 produces 32 bytes of output
