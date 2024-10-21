@@ -1,3 +1,4 @@
+//Authors: Bryan Mgbeojirikwe, Tanzila Tabassum, Maimouna Traore
 #include "util.h"
 #include <unistd.h>
 #include <errno.h>
