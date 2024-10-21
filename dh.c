@@ -1,3 +1,4 @@
+//Authors: Bryan Mgbeojirikwe, Tanzila Tabassum, Maimouna Traore
 /* Diffie Hellman key exchange, and HKDF for key derivation. */
 #include <openssl/evp.h>
 #include <openssl/err.h>
